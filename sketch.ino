@@ -37,11 +37,10 @@ namespace Config {
     constexpr uint32_t LONG_PRESS_MS = 2000;
     constexpr uint32_t TEST_STEP_MS = 500;
     constexpr uint32_t TEST_BLANK_MS = 250;
-    constexpr uint32_t ENCODER_FILTER_MS = 2;
+    constexpr uint32_t ENCODER_DEBOUNCE_US = 1500;
 
     // Для нестандартного физического энкодера направление можно поменять.
     constexpr bool REVERSE_ENCODER = false;
-    constexpr uint8_t ENCODER_QUEUE_SIZE = 32;
 }
 
 // Неблокирующий антидребезг. Одно отпускание даёт ровно одно событие.
@@ -104,11 +103,12 @@ bool comboTimerRunning = false;
 bool comboAlreadyExecuted = false;
 uint32_t comboStartedAt = 0;
 
-// Энкодер опрашивается из loop(). Такой способ стабильно работает
-// и на реальной Arduino UNO, и в симуляторах, где прерывания энкодера
-// иногда обрабатываются иначе.
-bool previousEncoderClk = HIGH;
-uint32_t lastEncoderStepAt = 0;
+// Энкодер ловится аппаратным прерыванием по спаду CLK.
+// Это не позволяет симулятору "проглотить" короткий импульс между
+// двумя проходами loop(). В обработчике только запоминается направление;
+// вся логика интерфейса выполняется уже в основном цикле.
+volatile int8_t pendingEncoderSteps = 0;
+volatile uint32_t lastEncoderInterruptUs = 0;
 
 uint8_t bitIndexForLed(uint8_t ledIndex) {
     return currentPage * 4 + (3 - ledIndex);
@@ -168,32 +168,35 @@ void printState(const __FlashStringHelper* eventName) {
     }
 }
 
-// Чтение KY-040 без прерываний. Один переход CLK HIGH -> LOW = один шаг.
-// Направление определяется состоянием DT в момент спада CLK.
-void processEncoder(uint32_t now) {
-    const bool currentClk = digitalRead(Config::ENCODER_CLK_PIN);
-
-    if (currentClk == previousEncoderClk) {
+// Вызывается на каждом спаде CLK энкодера.
+void onEncoderStep() {
+    const uint32_t nowUs = micros();
+    if (uint32_t(nowUs - lastEncoderInterruptUs) < Config::ENCODER_DEBOUNCE_US) {
         return;
     }
-
-    const bool oldClk = previousEncoderClk;
-    previousEncoderClk = currentClk;
-
-    // Считаем только спад CLK. Второй фронт одного щелчка игнорируется.
-    if (!(oldClk == HIGH && currentClk == LOW)) {
-        return;
-    }
-
-    // Короткий фильтр от механического дребезга.
-    if (uint32_t(now - lastEncoderStepAt) < Config::ENCODER_FILTER_MS) {
-        return;
-    }
-    lastEncoderStepAt = now;
+    lastEncoderInterruptUs = nowUs;
 
     int8_t direction = digitalRead(Config::ENCODER_DT_PIN) == HIGH ? 1 : -1;
     if (Config::REVERSE_ENCODER) {
         direction = -direction;
+    }
+
+    // Ограничиваем очередь, чтобы случайный дребезг не накопил сотни шагов.
+    if (direction > 0 && pendingEncoderSteps < 12) {
+        ++pendingEncoderSteps;
+    } else if (direction < 0 && pendingEncoderSteps > -12) {
+        --pendingEncoderSteps;
+    }
+}
+
+void processEncoder() {
+    noInterrupts();
+    int8_t steps = pendingEncoderSteps;
+    pendingEncoderSteps = 0;
+    interrupts();
+
+    if (steps == 0) {
+        return;
     }
 
     // Во время комбинации кнопок поворот не меняет выбранный бит.
@@ -201,18 +204,35 @@ void processEncoder(uint32_t now) {
         return;
     }
 
-    if (!cursorHasPosition) {
-        selectedLed = direction > 0 ? 0 : 3;
-        cursorHasPosition = true;
-    } else if (direction > 0 && selectedLed < 3) {
-        ++selectedLed;
-    } else if (direction < 0 && selectedLed > 0) {
-        --selectedLed;
+    bool changed = false;
+
+    while (steps != 0) {
+        const int8_t direction = steps > 0 ? 1 : -1;
+        steps += direction > 0 ? -1 : 1;
+
+        if (!cursorHasPosition) {
+            selectedLed = direction > 0 ? 0 : 3;
+            cursorHasPosition = true;
+            changed = true;
+            continue;
+        }
+
+        const int8_t nextLed = int8_t(selectedLed) + direction;
+        if (nextLed >= 0 && nextLed <= 3) {
+            selectedLed = uint8_t(nextLed);
+            changed = true;
+        }
     }
 
+    // Даже если упёрлись в край, выбранный бит остаётся подсвеченным.
     selectionActive = true;
-    updateDisplay();
-    printState(F("vybor-bita"));
+
+    if (changed) {
+        updateDisplay();
+        printState(F("vybor-bita"));
+    } else {
+        updateDisplay();
+    }
 }
 
 void switchPage() {
@@ -313,9 +333,11 @@ void updateStartup(uint32_t now) {
         return;
     }
 
-    // Запоминаем начальный уровень CLK. Дальше энкодер читается в loop().
-    previousEncoderClk = digitalRead(Config::ENCODER_CLK_PIN);
-    lastEncoderStepAt = now;
+    // Всё, что могло накопиться во время стартового теста, отбрасываем.
+    noInterrupts();
+    pendingEncoderSteps = 0;
+    lastEncoderInterruptUs = micros();
+    interrupts();
 
     pageButton.begin(now);
     editButton.begin(now);
@@ -339,6 +361,7 @@ void setup() {
     digitalWrite(Config::PAGE_LSB_PIN, LOW);
     pinMode(Config::ENCODER_CLK_PIN, INPUT_PULLUP);
     pinMode(Config::ENCODER_DT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(Config::ENCODER_CLK_PIN), onEncoderStep, FALLING);
 
     startupStartedAt = millis();
     pageButton.begin(startupStartedAt);
@@ -358,5 +381,5 @@ void loop() {
     }
 
     processButtons(now);
-    processEncoder(now);
+    processEncoder();
 }
