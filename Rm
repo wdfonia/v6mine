@@ -1,0 +1,50 @@
+const byte buttonPin = 12;
+const unsigned long holdMs = 600;     // Порог долгого нажатия
+const unsigned long debounceMs = 25;  // Защита от дребезга
+
+bool lastReading = HIGH;
+bool buttonState = HIGH;
+bool shiftMode = false;
+bool inverted = false;
+
+unsigned long changedAt = 0;
+unsigned long pressedAt = 0;
+
+void setup() {
+  pinMode(buttonPin, INPUT_PULLUP);   // Нажата = LOW, отпущена = HIGH
+  Serial.begin(9600);
+  Serial.println("Режим ввода числа");
+}
+
+void loop() {
+  unsigned long now = millis();
+  bool reading = digitalRead(buttonPin);
+
+  // Если контакт изменился, ждём, пока сигнал станет устойчивым.
+  if (reading != lastReading) {
+    lastReading = reading;
+    changedAt = now;
+  }
+
+  if (reading != buttonState && now - changedAt >= debounceMs) {
+    buttonState = reading;
+
+    if (buttonState == LOW) {
+      pressedAt = changedAt;           // Кнопку нажали
+    } else if (inverted) {
+      inverted = false;                // Отпустили после удержания
+      Serial.println("Инверсия выключена");
+    } else {
+      shiftMode = !shiftMode;          // Отпустили после короткого нажатия
+      if (shiftMode) Serial.println("Режим сдвига");
+      else           Serial.println("Режим ввода числа");
+    }
+  }
+
+  // Срабатывает один раз, как только кнопку продержали 600 мс.
+  if (buttonState == LOW && reading == LOW &&
+      !inverted && now - pressedAt >= holdMs) {
+    inverted = true;
+    Serial.println("Инверсия включена");
+  }
+}
